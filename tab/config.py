@@ -27,6 +27,12 @@ def go_settings_tab(header_ui):
     proxy_assignment_strategy_default = str(
         ConfigDB.get("proxyAssignmentStrategy") or "balanced"
     ).lower()
+    if proxy_assignment_strategy_default not in {
+        "balanced",
+        "queue",
+        "local_fanout",
+    }:
+        proxy_assignment_strategy_default = "balanced"
 
     def _split_proxy_lines(proxy_text: str | None) -> list[str]:
         if not proxy_text:
@@ -45,6 +51,13 @@ def go_settings_tab(header_ui):
 
     def get_latest_proxy():
         return _format_proxy_text(ConfigDB.get("https_proxy") or "")
+
+    def get_proxy_api_url():
+        return ConfigDB.get("proxyApiUrl") or ""
+
+    def get_proxy_api_protocol():
+        protocol = str(ConfigDB.get("proxyApiProtocol") or "http").lower()
+        return "socks5" if protocol in {"socks", "socks5"} else "http"
 
     def input_https_proxy(_https_proxy):
         normalized_proxy = _serialize_proxy_text(_https_proxy)
@@ -71,6 +84,41 @@ def go_settings_tab(header_ui):
 
     def show_proxy_test_loading():
         return gr.update(value="正在测试代理连通性，请稍候...", visible=True)
+
+    def fetch_proxy_from_api(api_url, protocol):
+        try:
+            from util.proxy.ProxyApiProvider import fetch_proxy_api
+
+            protocol = (
+                "socks5" if str(protocol).lower() in {"socks", "socks5"} else "http"
+            )
+            ConfigDB.insert("proxyApiUrl", str(api_url or "").strip())
+            ConfigDB.insert("proxyApiProtocol", protocol)
+            count = ConfigDB.get_as_int("queueConcurrencyLimit", 0)
+            if count <= 0:
+                count = max(
+                    1, len(_split_proxy_lines(ConfigDB.get("https_proxy") or ""))
+                )
+            result = fetch_proxy_api(api_url, count=count, protocol=protocol)
+            ConfigDB.insert("https_proxy", ",".join(result.proxies))
+            gr.Info(f"已从代理 API 获取 {len(result.proxies)} 个代理。")
+            return gr.update(value="\n".join(result.proxies)), gr.update(
+                value=f"✅ 已获取 {len(result.proxies)} 个代理",
+                visible=True,
+            )
+        except Exception as e:
+            return gr.update(), gr.update(
+                value=f"❌ 获取代理失败: {str(e)}", visible=True
+            )
+
+    def save_proxy_api_config(api_url, protocol):
+        protocol = "socks5" if str(protocol).lower() in {"socks", "socks5"} else "http"
+        ConfigDB.insert("proxyApiUrl", str(api_url or "").strip())
+        ConfigDB.insert("proxyApiProtocol", protocol)
+        gr.Info("代理 API 配置已保存。")
+        return gr.update(value=ConfigDB.get("proxyApiUrl") or ""), gr.update(
+            value=protocol
+        )
 
     def inner_input_serverchan(x):
         ConfigDB.insert("serverchanKey", x)
@@ -186,6 +234,10 @@ def go_settings_tab(header_ui):
     def update_proxy_assignment_strategy(value):
         ConfigDB.insert("proxyAssignmentStrategy", value)
         return gr.update(value=ConfigDB.get("proxyAssignmentStrategy"))
+
+    def update_proxy_include_direct(value):
+        ConfigDB.insert("proxyIncludeDirect", value)
+        return gr.update(value=ConfigDB.get_as_bool("proxyIncludeDirect", True))
 
     def update_log_level(value):
         ConfigDB.insert("logLevel", value)
@@ -347,6 +399,37 @@ def go_settings_tab(header_ui):
                         placeholder="点击上方按钮开始测试代理连通性...",
                         visible=False,
                     )
+                    gr.Markdown("### 通过代理 API 获取")
+                    proxy_api_url_ui = gr.Textbox(
+                        label="代理 API 地址",
+                        placeholder="例如：http://api.youdaili.com/v1/proxy/get?app_key=...&app_secret=...&count=&format=&protocol=",
+                        value=get_proxy_api_url(),
+                    )
+                    proxy_api_protocol_ui = gr.Dropdown(
+                        label="代理地址类型",
+                        choices=[
+                            ("HTTP / HTTPS", "http"),
+                            ("SOCKS5", "socks5"),
+                        ],
+                        value=get_proxy_api_protocol(),
+                        interactive=True,
+                        allow_custom_value=False,
+                        filterable=False,
+                    )
+                    with gr.Row(elem_classes="btb-inline-actions !justify-end"):
+                        save_proxy_api_btn = gr.Button(
+                            "保存 API 配置",
+                            elem_classes="btb-soft-button",
+                        )
+                        fetch_proxy_api_btn = gr.Button(
+                            "获取并填入代理",
+                            elem_classes="btb-soft-button",
+                        )
+                    proxy_api_result_ui = gr.Textbox(
+                        label="代理 API 结果",
+                        interactive=False,
+                        visible=False,
+                    )
                     gr.Markdown(
                         """
                         <div class="mt-3 text-sm leading-7 text-slate-700">
@@ -355,6 +438,7 @@ def go_settings_tab(header_ui):
                           <p><strong>带账号密码的 HTTP 代理示例：</strong><code>http://proxyuser:proxypass@xx.xx.xx.xx:8080</code></p>
                           <p><strong>程序什么时候会用代理：</strong>当抢票流程检测到风控时，会按你填写的顺序切换到下一个代理；当前请求不会在请求层立刻自动重试，下一次抢票重试才会使用新代理。</p>
                           <p><strong>代理失效怎么处理：</strong>同一代理在短时间内连续失败会被暂时冷却；如果所有代理都不可用，程序会按递增时间休息后再试。</p>
+                          <p><strong>代理 API：</strong>保存 API 地址后，程序会在代理全部不可用时自动按并发数请求新代理；请求会自动带上 <code>format=json</code>、<code>count</code> 和所选 <code>protocol</code>。</p>
                           <p><strong>建议先测试再开抢：</strong>保存后点击上方“测试代理连通性”，确认代理能正常访问哔哩哔哩接口。</p>
                           <p><strong>自建代理：</strong>如果你没有现成代理，可以自己在 Ubuntu / Debian 服务器上搭建 Squid HTTP 代理。</p>
                           <p><strong>完整搭建说明：</strong><a href="https://github.com/mikumifa/biliTickerBuy/blob/main/docs/proxy-self-hosting.md" target="_blank" rel="noopener noreferrer">GitHub 查看自建代理指南</a></p>
@@ -387,6 +471,41 @@ def go_settings_tab(header_ui):
                         label="无可用代理时发送提醒",
                         value=buy_defaults.notifier_config.notify_proxy_exhausted,
                         info="默认关闭。开启后，当所有代理都进入冷却且程序需要休息时，会通过已配置的推送渠道提醒你补充代理。",
+                    )
+                    gr.Markdown("## 并发")
+                    gr.Markdown(
+                        """
+                        <div class="mt-2 text-sm leading-7 text-slate-700">
+                          <p><strong>均匀分配模式：</strong>程序会尽量把代理均匀分配给所有抢票任务。适合代理数量较多的情况。但是如果你配置的代理数目不够多，同一个代理在运行过程中可能会被多个程序使用。</p>
+                          <p><strong>队列模式：</strong>程序会将代理作为队列资源分配给抢票任务，尽量保证同一时间内每个正在运行的任务使用不同的代理。如果抢票任务数为 n，代理数量为 m：当 n &lt;= m 时，每个抢票任务都会分配到不同的代理；当 n &gt; m 时，最多同时运行 m 个抢票任务，未分配到代理的任务会进入等待队列，等前面的任务结束后再继续执行。这种模式适合希望同一时间内每个任务尽量使用不同 IP，并避免多个任务共用同一个代理的场景。</p>
+                          <p><strong>代理池并发：</strong>每个任务都会拿到完整代理池，并在关键 create 请求上通过多个代理同时尝试，谁先返回有效结果就优先使用。适合单个热门票档冲刺，但要求至少配置一个真实代理，不会使用直连。</p>
+                        </div>
+                        """
+                    )
+                    proxy_assignment_strategy_ui = gr.Dropdown(
+                        label="任务代理分配策略",
+                        choices=[
+                            ("均匀分配", "balanced"),
+                            ("队列模式", "queue"),
+                            ("代理池并发", "local_fanout"),
+                        ],
+                        value=proxy_assignment_strategy_default,
+                        interactive=True,
+                        allow_custom_value=False,
+                        filterable=False,
+                    )
+
+                    proxy_include_direct_ui = gr.Checkbox(
+                        label="允许使用直连（none）",
+                        value=ConfigDB.get_as_bool("proxyIncludeDirect", True),
+                        info="开启后，任务代理分配会把直连作为一个可用出口；关闭后，所有任务只使用已配置代理。",
+                    )
+                    queue_concurrency_limit_ui = gr.Number(
+                        label="队列并发上限（仅队列模式）",
+                        value=ConfigDB.get_as_int("queueConcurrencyLimit", 0),
+                        minimum=0,
+                        step=1,
+                        info="填 0 表示等于代理数量。",
                     )
 
             with gr.Tab("音乐"):
@@ -526,25 +645,6 @@ def go_settings_tab(header_ui):
                         value=buy_defaults.auto_open_payment_url,
                         info="默认关闭。开启后，成功获取支付链接时会尝试用系统默认浏览器打开。",
                     )
-                    gr.Markdown("## 并发")
-                    proxy_assignment_strategy_ui = gr.Dropdown(
-                        label="任务代理分配策略",
-                        choices=[
-                            ("均匀分配", "balanced"),
-                            ("队列模式", "queue"),
-                        ],
-                        value=proxy_assignment_strategy_default,
-                        interactive=True,
-                        allow_custom_value=False,
-                        filterable=False,
-                    )
-                    queue_concurrency_limit_ui = gr.Number(
-                        label="队列并发上限（仅队列模式）",
-                        value=ConfigDB.get_as_int("queueConcurrencyLimit", 0),
-                        minimum=0,
-                        step=1,
-                        info="填 0 表示等于代理数量。",
-                    )
                     gr.Markdown("## 日志")
                     log_level_ui = gr.Dropdown(
                         label="日志级别",
@@ -643,6 +743,16 @@ def go_settings_tab(header_ui):
         inputs=[https_proxy_ui, test_timeout_ui],
         outputs=test_result_ui,
     )
+    save_proxy_api_btn.click(
+        fn=save_proxy_api_config,
+        inputs=[proxy_api_url_ui, proxy_api_protocol_ui],
+        outputs=[proxy_api_url_ui, proxy_api_protocol_ui],
+    )
+    fetch_proxy_api_btn.click(
+        fn=fetch_proxy_from_api,
+        inputs=[proxy_api_url_ui, proxy_api_protocol_ui],
+        outputs=[https_proxy_ui, proxy_api_result_ui],
+    )
 
     serverchan_ui.submit(
         fn=inner_input_serverchan, inputs=serverchan_ui, outputs=serverchan_ui
@@ -718,6 +828,11 @@ def go_settings_tab(header_ui):
         inputs=proxy_assignment_strategy_ui,
         outputs=proxy_assignment_strategy_ui,
     )
+    proxy_include_direct_ui.change(
+        fn=update_proxy_include_direct,
+        inputs=proxy_include_direct_ui,
+        outputs=proxy_include_direct_ui,
+    )
     _bind_number_commit(
         queue_concurrency_limit_ui,
         update_queue_concurrency_limit,
@@ -786,6 +901,8 @@ def go_settings_tab(header_ui):
         hide_header = ConfigDB.get_as_bool("hideHeader", False)
         return [
             gr.update(value=get_latest_proxy()),
+            gr.update(value=get_proxy_api_url()),
+            gr.update(value=get_proxy_api_protocol()),
             gr.update(value=ConfigDB.get("audioPath") or None),
             gr.update(value=ConfigDB.get("serverchanKey") or ""),
             gr.update(value=ConfigDB.get("serverchan3ApiUrl") or ""),
@@ -800,6 +917,7 @@ def go_settings_tab(header_ui):
             gr.update(
                 value=str(ConfigDB.get("proxyAssignmentStrategy") or "balanced").lower()
             ),
+            gr.update(value=ConfigDB.get_as_bool("proxyIncludeDirect", True)),
             gr.update(value=ConfigDB.get_as_int("queueConcurrencyLimit", 0)),
             gr.update(value=buy_defaults.log_level),
             gr.update(value=ConfigDB.get_as_bool("autoCleanupLogs", True)),
@@ -827,6 +945,8 @@ def go_settings_tab(header_ui):
 
     return load_go_settings_configs, [
         https_proxy_ui,
+        proxy_api_url_ui,
+        proxy_api_protocol_ui,
         audio_path_ui,
         serverchan_ui,
         serverchan3_ui,
@@ -839,6 +959,7 @@ def go_settings_tab(header_ui):
         show_qrcode_ui,
         auto_open_payment_url_ui,
         proxy_assignment_strategy_ui,
+        proxy_include_direct_ui,
         queue_concurrency_limit_ui,
         log_level_ui,
         auto_cleanup_logs_ui,

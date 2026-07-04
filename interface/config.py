@@ -27,6 +27,7 @@ class RuntimeOptions:
     outer_interval: int = 0
     create_retry_limit: int = 20
     create_request_batch_size: int = 3
+    create_request_proxy_strategy: str = "standard"
     time_start: str = ""
     audio_path: str = ""
     pushplusToken: str = ""
@@ -34,6 +35,9 @@ class RuntimeOptions:
     barkToken: str = ""
     meowNickname: str = ""
     https_proxys: str = "none"
+    proxy_api_url: str = ""
+    proxy_api_protocol: str = "http"
+    proxy_api_request_count: int = 0
     serverchan3ApiUrl: str = ""
     ntfy_url: str = ""
     ntfy_username: str = ""
@@ -292,6 +296,7 @@ def build_runtime_options(
     outer_interval: int = 0,
     create_retry_limit: int = 20,
     create_request_batch_size: int = 3,
+    create_request_proxy_strategy: str = "standard",
     time_start: str = "",
     audio_path: str = "",
     pushplusToken: str = "",
@@ -299,6 +304,9 @@ def build_runtime_options(
     barkToken: str = "",
     meowNickname: str = "",
     https_proxys: str = "none",
+    proxy_api_url: str = "",
+    proxy_api_protocol: str = "http",
+    proxy_api_request_count: int = 0,
     serverchan3ApiUrl: str = "",
     ntfy_url: str = "",
     ntfy_username: str = "",
@@ -325,6 +333,9 @@ def build_runtime_options(
             create_request_batch_size,
             default=3,
         ),
+        create_request_proxy_strategy=str(
+            create_request_proxy_strategy or "standard"
+        ).lower(),
         time_start=normalize_time_start(time_start),
         audio_path=audio_path,
         pushplusToken=pushplusToken,
@@ -332,6 +343,12 @@ def build_runtime_options(
         barkToken=barkToken,
         meowNickname=meowNickname,
         https_proxys=https_proxys,
+        proxy_api_url=proxy_api_url,
+        proxy_api_protocol=proxy_api_protocol,
+        proxy_api_request_count=normalize_non_negative_interval(
+            proxy_api_request_count,
+            default=0,
+        ),
         serverchan3ApiUrl=serverchan3ApiUrl,
         ntfy_url=ntfy_url,
         ntfy_username=ntfy_username,

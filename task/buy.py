@@ -24,19 +24,20 @@ from app_cmd.config.BuyConfig import BuyConfig
 from interface.project import fetch_project_payload
 from util.notifer.Notifier import NotifierManager
 from util.proxy.ProxyBackoff import ProxyBackoff
+from util.proxy.ProxyApiProvider import fetch_proxy_api
 from util.proxy.ProxyManager import ProxyManager
 from util.notifer.RandomMessages import get_random_fail_message
-from util.TimeUtil import current_time_ms
+from util import time_service
 from util.ErrorCodes import ErrorCodes
 from task.buy_helpers import (
     BASE_URL as base_url,
+    build_payment_result,
     build_token_payload as _build_token_payload,
     create_order_terminal_rule as _create_order_terminal_rule,
     extract_order_id as _extract_order_id,
     format_retry_reason as _format_retry_reason,
     format_status_result as _format_status_result,
     get_order_detail_url,
-    get_qrcode_url,
     handle_proxy_failure as _handle_proxy_failure,
     is_create_success as _is_create_success,
     prepare_create_request as _prepare_create_request,
@@ -53,6 +54,9 @@ from task.buy_types import (
 )
 from util.request.BiliRequest import BiliRequest
 from util.request.exceptions import BiliConnectionError, BiliRateLimitError
+
+
+LOCAL_FANOUT_PROXY_STRATEGY = "local_fanout"
 
 
 @dataclass(slots=True)
@@ -221,16 +225,74 @@ def buy_stream(config: BuyConfig):
             data=update.to_dict() if update is not None else {},
         )
 
+    def emit_payment_details(
+        payment_result: dict,
+        *,
+        status: str,
+    ):
+        update = BuyStreamUpdate(
+            order_id=payment_result.get("order_id"),
+            order_detail_url=payment_result.get("order_detail_url"),
+            payment_code_url=payment_result.get("payment_code_url"),
+            payment_qr_url=payment_result.get("payment_qr_url"),
+            status=status,
+        )
+
+        markers = [
+            ("ORDER_ID", payment_result.get("order_id")),
+            ("ORDER_DETAIL_URL", payment_result.get("order_detail_url")),
+            ("PAYMENT_CODE_URL", payment_result.get("payment_code_url")),
+            ("PAYMENT_QR_URL", payment_result.get("payment_qr_url")),
+        ]
+        for marker, value in markers:
+            if value in (None, ""):
+                continue
+            yield emit("payment_qr", f"{marker}={value}", update)
+
     def handle_proxy_failure(
         reason: str,
         *,
         attempt: int | None = None,
     ):
+        def replenish_proxy_pool():
+            if not str(config.proxy_api_url or "").strip():
+                return False, None
+            try:
+                request_count = int(config.proxy_api_request_count or 0)
+            except (TypeError, ValueError):
+                request_count = 0
+            if request_count <= 0:
+                request_count = max(
+                    1,
+                    len(
+                        [
+                            proxy
+                            for proxy in _request.proxy_manager.proxy_list
+                            if proxy.lower() != "none"
+                        ]
+                    ),
+                )
+            try:
+                result = fetch_proxy_api(
+                    config.proxy_api_url,
+                    count=request_count,
+                    protocol=config.proxy_api_protocol,
+                )
+                _request.replace_proxy_pool(",".join(result.proxies))
+                return (
+                    True,
+                    f"已从代理 API 自动获取 {len(result.proxies)} 个新代理",
+                )
+            except Exception as exc:
+                logger.warning(f"代理 API 自动获取失败: {exc}")
+                return False, f"代理 API 自动获取失败: {exc}"
+
         immediate_message, delay_seconds = _handle_proxy_failure(
             _request,
             reason,
             proxy_backoff,
             config.notifier_config,
+            replenish_proxy_pool=replenish_proxy_pool,
         )
         attempt_total = (
             effective_retry_limit if attempt is not None else state.attempt_total
@@ -332,11 +394,25 @@ def buy_stream(config: BuyConfig):
     tickets_info["deliver_info"] = json.dumps(tickets_info["deliver_info"])
     masked_proxies = ProxyManager.mask_proxy_string(config.https_proxys)
     logger.info(f"目前已配置代理：{masked_proxies or '直连'}")
+    h2_client_type = None
+    h2_client_options = None
+    if config.create_request_proxy_strategy == LOCAL_FANOUT_PROXY_STRATEGY:
+        from util.h2client.ja_h2_client import ProxyPoolCreateV2FanoutJA3H2Client
+
+        proxy_pool = [
+            proxy
+            for proxy in ProxyManager.parse_proxy_list(config.https_proxys)
+            if proxy.lower() != "none"
+        ]
+        h2_client_type = ProxyPoolCreateV2FanoutJA3H2Client
+        h2_client_options = {"proxy_pool": proxy_pool}
     _request = BiliRequest(
         cookies=cookies,
         proxy=config.https_proxys,
         proxy_failure_threshold=config.proxy_max_consecutive_failures,
         proxy_cooldown_seconds=config.proxy_cooldown_seconds,
+        h2_client_type=h2_client_type,
+        h2_client_options=h2_client_options,
     )
     proxy_backoff = ProxyBackoff(max_seconds=config.proxy_backoff_max_seconds)
     is_hot_project = bool(tickets_info.get("is_hot_project", False))
@@ -431,7 +507,7 @@ def buy_stream(config: BuyConfig):
     while isRunning:
         try:
             request_result: dict | None = None
-            ticket_collection_t = current_time_ms()
+            ticket_collection_t = time_service.current_time_ms()
             ticket_state = init_ctoken_state(
                 browser_window_state=browser_window_state,
                 href_length=len(
@@ -450,6 +526,7 @@ def buy_stream(config: BuyConfig):
                 data=token_payload,
                 isJson=True,
             )
+
             request_result = request_result_normal.json()
             proxy_backoff.reset()
             yield emit(
@@ -679,23 +756,47 @@ def buy_stream(config: BuyConfig):
                     errno, terminal_ret, terminal_rule = terminal_result
                     order_id = _extract_order_id(terminal_ret)
                     if terminal_rule.expose_payment_url and order_id is not None:
-                        payment_url = get_order_detail_url(order_id)
-                        yield emit(
-                            "payment_qr",
-                            "PAYMENT_QR_URL={0}".format(payment_url),
-                            BuyStreamUpdate(
-                                payment_qr_url=payment_url,
-                                status=terminal_rule.status,
-                            ),
-                        )
+                        payment_result = {
+                            "order_id": order_id,
+                            "order_detail_url": get_order_detail_url(order_id),
+                            "payment_code_url": None,
+                            "payment_qr_url": get_order_detail_url(order_id),
+                        }
+                        try:
+                            payment_result = build_payment_result(_request, order_id)
+                        except Exception as exc:
+                            yield emit(
+                                "status",
+                                f"获取支付二维码链接失败，将继续返回订单详情页: {exc}",
+                                BuyStreamUpdate(
+                                    order_id=payment_result["order_id"],
+                                    order_detail_url=payment_result["order_detail_url"],
+                                    payment_qr_url=payment_result["payment_qr_url"],
+                                    status=terminal_rule.status,
+                                ),
+                            )
+                        for payment_event in emit_payment_details(
+                            payment_result,
+                            status=terminal_rule.status,
+                        ):
+                            yield payment_event
                         if config.auto_open_payment_url:
                             try:
-                                webbrowser.open(payment_url)
+                                webbrowser.open(payment_result["order_detail_url"])
                                 yield emit(
                                     "status",
                                     "已自动打开现有订单链接",
                                     BuyStreamUpdate(
-                                        payment_qr_url=payment_url,
+                                        order_id=payment_result.get("order_id"),
+                                        order_detail_url=payment_result.get(
+                                            "order_detail_url"
+                                        ),
+                                        payment_code_url=payment_result.get(
+                                            "payment_code_url"
+                                        ),
+                                        payment_qr_url=payment_result.get(
+                                            "payment_qr_url"
+                                        ),
                                         status=terminal_rule.status,
                                     ),
                                 )
@@ -729,35 +830,31 @@ def buy_stream(config: BuyConfig):
                     ),
                 )
                 order_id = request_result["data"]["orderId"]  # type: ignore
-                payment_url = get_order_detail_url(order_id)
-                qrcode_url = get_qrcode_url(
-                    _request,
-                    order_id,
-                )
-                yield emit(
-                    "payment_qr",
-                    "PAYMENT_QR_URL={0}".format(payment_url),
-                    BuyStreamUpdate(
-                        payment_qr_url=payment_url,
-                        status="succeeded",
-                    ),
-                )
+                payment_result = build_payment_result(_request, order_id)
+                for payment_event in emit_payment_details(
+                    payment_result,
+                    status="succeeded",
+                ):
+                    yield payment_event
                 if config.auto_open_payment_url:
                     try:
-                        webbrowser.open(payment_url)
+                        webbrowser.open(payment_result["order_detail_url"])
                         yield emit(
                             "status",
                             "已自动打开支付链接",
                             BuyStreamUpdate(
-                                payment_qr_url=payment_url,
+                                order_id=payment_result.get("order_id"),
+                                order_detail_url=payment_result.get("order_detail_url"),
+                                payment_code_url=payment_result.get("payment_code_url"),
+                                payment_qr_url=payment_result.get("payment_qr_url"),
                                 status="succeeded",
                             ),
                         )
                     except Exception as exc:
                         yield emit("status", f"自动打开支付链接失败: {exc}")
-                if config.show_qrcode:
+                if config.show_qrcode and payment_result.get("payment_code_url"):
                     qr_gen = qrcode.QRCode()
-                    qr_gen.add_data(qrcode_url)
+                    qr_gen.add_data(payment_result["payment_code_url"])
                     qr_gen.make(fit=True)
                     qr_gen_image = qr_gen.make_image()
                     qr_gen_image.show()  # type: ignore
@@ -771,6 +868,12 @@ def buy_stream(config: BuyConfig):
                 f"订单准备请求异常({e.__class__.__name__})"
             ):
                 yield message
+        except JSONDecodeError:
+            yield from handle_non_json_response(
+                "准备订单接口",
+                request_result_normal,
+                attempt=0,
+            )
         except BiliRateLimitError as e:
             logger.warning(str(e))
             yield emit(
