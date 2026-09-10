@@ -79,6 +79,33 @@ class NotifierConfig(BasicConfig):
     )
     """MeoW nickname."""
 
+    telegram_bot_token: str = config_field(
+        "",
+        env="BTB_TELEGRAM_BOT_TOKEN",
+        runtime="telegram_bot_token",
+        db="telegramBotToken",
+        cli="--notifier-config.telegram-bot-token",
+    )
+    """Telegram Bot token from @BotFather."""
+
+    telegram_chat_id: str = config_field(
+        "",
+        env="BTB_TELEGRAM_CHAT_ID",
+        runtime="telegram_chat_id",
+        db="telegramChatId",
+        cli="--notifier-config.telegram-chat-id",
+    )
+    """Telegram chat ID (user, group, or channel)."""
+
+    telegram_http_proxy: str = config_field(
+        "",
+        env="BTB_TELEGRAM_HTTP_PROXY",
+        runtime="telegram_http_proxy",
+        db="telegramHttpProxy",
+        cli="--notifier-config.telegram-http-proxy",
+    )
+    """HTTP proxy for Telegram API requests (e.g. http://127.0.0.1:8080)."""
+
     audio_path: str = config_field(
         "",
         env="BTB_AUDIO_PATH",
@@ -97,6 +124,46 @@ class NotifierConfig(BasicConfig):
         cli_true="--notifier-config.notify-proxy-exhausted",
     )
     """Send a notification when all proxies enter cooldown."""
+
+    notify_connect_timeout: float = config_field(
+        5.0,
+        env="BTB_NOTIFY_CONNECT_TIMEOUT",
+        runtime="notify_connect_timeout",
+        db="notifyConnectTimeout",
+        cli="--notifier-config.notify-connect-timeout",
+        cast=float,
+    )
+    """HTTP connect timeout for each push channel, in seconds."""
+
+    notify_read_timeout: float = config_field(
+        10.0,
+        env="BTB_NOTIFY_READ_TIMEOUT",
+        runtime="notify_read_timeout",
+        db="notifyReadTimeout",
+        cli="--notifier-config.notify-read-timeout",
+        cast=float,
+    )
+    """HTTP read timeout for each push channel, in seconds."""
+
+    notify_retries: int = config_field(
+        3,
+        env="BTB_NOTIFY_RETRIES",
+        runtime="notify_retries",
+        db="notifyRetries",
+        cli="--notifier-config.notify-retries",
+        cast=int,
+    )
+    """Maximum attempts per channel for synchronous send-on-exit."""
+
+    notify_backoff: float = config_field(
+        0.5,
+        env="BTB_NOTIFY_BACKOFF",
+        runtime="notify_backoff",
+        db="notifyBackoff",
+        cli="--notifier-config.notify-backoff",
+        cast=float,
+    )
+    """Initial exponential backoff between retries, in seconds."""
 
     @classmethod
     def from_runtime_options(cls, runtime_options) -> "NotifierConfig":

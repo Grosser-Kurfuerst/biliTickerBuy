@@ -29,20 +29,25 @@ from util.proxy.ProxyManager import ProxyManager
 from util.notifer.RandomMessages import get_random_fail_message
 from util import time_service
 from util.ErrorCodes import ErrorCodes
+from util.h2client.constants import H2CLIENT_CONNECTIONS_PER_SOURCE_IP
 from task.buy_helpers import (
     BASE_URL as base_url,
-    build_payment_result,
+    build_payment_result_with_fallback,
     build_token_payload as _build_token_payload,
     create_order_terminal_rule as _create_order_terminal_rule,
     extract_order_id as _extract_order_id,
     format_retry_reason as _format_retry_reason,
     format_status_result as _format_status_result,
-    get_order_detail_url,
     handle_proxy_failure as _handle_proxy_failure,
     is_create_success as _is_create_success,
     prepare_create_request as _prepare_create_request,
     summarize_non_json_response as _summarize_non_json_response,
     wait_until_start as _wait_until_start,
+)
+from task.page_gate import (
+    check_ticket_page_availability,
+    mobile_ticket_page_url,
+    normalize_mobile_ticket_page_url,
 )
 from task.buy_types import (
     BuyStreamEvent,
@@ -203,6 +208,73 @@ def _extract_prepare_token(result: dict | None) -> str | None:
 
 def _format_reprepare_reason(reason: str) -> str:
     return f"重新准备订单，原因：{reason}"
+
+
+def _resolve_notify_retry_params(notifier_config) -> tuple[int, float]:
+    """从 NotifierConfig 解析 (retries, backoff)，非法/缺失回退到 (3, 0.5)。"""
+    try:
+        retries = int(getattr(notifier_config, "notify_retries", 3))
+    except (TypeError, ValueError):
+        retries = 3
+    retries = max(1, retries)
+
+    try:
+        backoff = float(getattr(notifier_config, "notify_backoff", 0.5))
+    except (TypeError, ValueError):
+        backoff = 0.5
+    if backoff < 0:
+        backoff = 0.5
+
+    return retries, backoff
+
+
+def _precheck_notifiers(notifier_config) -> None:
+    """进入等待/倒计时前，对已配置通知渠道做一次轻量探测并打日志。
+
+    仅对已配置的渠道创建实例并尝试发送一条预检消息（同步、带 timeout+重试），
+    结果（成功/失败/耗时）打进日志。任何失败只告警，不抛出、不阻断抢票流程。
+    """
+    try:
+        manager = NotifierManager.create_from_config(
+            config=notifier_config,
+            title="抢票预检",
+            content="biliTickerBuy 通知链路预检，收到说明推送渠道可用。",
+            include_audio=False,
+        )
+    except Exception as exc:
+        logger.warning(f"通知渠道预检初始化失败（不影响抢票）: {exc}")
+        return
+
+    names = manager.list_notifiers()
+    if not names:
+        logger.info("通知渠道预检：未配置任何推送渠道，跳过")
+        return
+
+    # 预检仍固定 retries=1 轻探（不阻断抢票），但退避沿用配置值。
+    _, backoff = _resolve_notify_retry_params(notifier_config)
+
+    logger.info(f"通知渠道预检开始，已配置渠道: {names}")
+    for name, notifer in manager.notifier_dict.items():
+        start = time.time()
+        try:
+            ok = notifer.send_once_sync(
+                "抢票预检",
+                "biliTickerBuy 通知链路预检，收到说明推送渠道可用。",
+                retries=1,
+                backoff=backoff,
+            )
+            elapsed = time.time() - start
+            if ok:
+                logger.info(f"通知渠道预检成功: {name}（耗时 {elapsed:.2f}s）")
+            else:
+                logger.warning(
+                    f"通知渠道预检失败: {name}（耗时 {elapsed:.2f}s，仅告警不阻断抢票）"
+                )
+        except Exception as exc:
+            elapsed = time.time() - start
+            logger.warning(
+                f"通知渠道预检异常: {name} - {exc}（耗时 {elapsed:.2f}s，仅告警不阻断抢票）"
+            )
 
 
 def buy_stream(config: BuyConfig):
@@ -399,13 +471,21 @@ def buy_stream(config: BuyConfig):
     if config.create_request_proxy_strategy == LOCAL_FANOUT_PROXY_STRATEGY:
         from util.h2client.ja_h2_client import ProxyPoolCreateV2FanoutJA3H2Client
 
-        proxy_pool = [
-            proxy
-            for proxy in ProxyManager.parse_proxy_list(config.https_proxys)
-            if proxy.lower() != "none"
-        ]
+        proxy_pool = ProxyManager.parse_proxy_list(config.https_proxys)
+        if not proxy_pool:
+            proxy_pool = ["none"]
+        try:
+            h2_connections_per_source_ip = max(
+                1,
+                int(config.h2_connections_per_source_ip),
+            )
+        except (TypeError, ValueError):
+            h2_connections_per_source_ip = H2CLIENT_CONNECTIONS_PER_SOURCE_IP
         h2_client_type = ProxyPoolCreateV2FanoutJA3H2Client
-        h2_client_options = {"proxy_pool": proxy_pool}
+        h2_client_options = {
+            "proxy_pool": proxy_pool,
+            "connections_per_source_ip": h2_connections_per_source_ip,
+        }
     _request = BiliRequest(
         cookies=cookies,
         proxy=config.https_proxys,
@@ -423,6 +503,31 @@ def buy_stream(config: BuyConfig):
     effective_retry_limit = max(1, int(config.create_retry_limit))
     effective_batch_size = max(1, int(config.create_request_batch_size))
     rate_limit_delay_ms = max(0, int(config.rate_limit_delay_ms))
+    wait_for_buy_button = bool(config.wait_for_buy_button)
+    page_status_check = None
+    page_check_before_seconds = max(0, int(config.buy_page_check_before_seconds))
+    page_timeout_seconds = max(1, int(config.buy_page_timeout_seconds))
+    if wait_for_buy_button:
+        configured_page_url = str(config.buy_page_url or "").strip()
+        try:
+            buy_page_url = (
+                normalize_mobile_ticket_page_url(configured_page_url)
+                if configured_page_url
+                else mobile_ticket_page_url(tickets_info["project_id"])
+            )
+        except ValueError as exc:
+            buy_page_url = configured_page_url
+            logger.warning("购票页链接无效，将在校验阶段等待至超时：{}", exc)
+
+        def page_status_check():
+            return check_ticket_page_availability(_request, buy_page_url)
+
+        logger.info(
+            "已开启立即购票校验：移动端链接={}，提前{}秒开始，超时{}秒",
+            buy_page_url,
+            page_check_before_seconds,
+            page_timeout_seconds,
+        )
 
     def emit_reprepare(reason: str):
         message = _format_reprepare_reason(reason)
@@ -481,13 +586,27 @@ def buy_stream(config: BuyConfig):
         ),
     )
 
+    # 进入等待/倒计时前，对已配置的通知渠道做一次轻量预检并打日志。
+    # 失败只告警不阻断抢票（避免通知配置问题耽误抢票）。
+    _precheck_notifiers(config.notifier_config)
+
     for wait_state in _wait_until_start(
         config.time_start,
         warmup=refresh_hot_and_warm,
+        page_status_check=page_status_check,
+        page_check_before_seconds=page_check_before_seconds,
+        page_timeout_seconds=page_timeout_seconds,
     ):
         wait_message = wait_state.get("message")
         countdown_value = wait_state.get("countdown")
         countdown_seconds = wait_state.get("countdown_seconds")
+        if wait_state.get("page_gate_timeout"):
+            yield emit(
+                "error",
+                wait_message,
+                BuyStreamUpdate(status="failed", stage="购票页校验超时"),
+            )
+            return
         stage_value = None
         if isinstance(wait_message, str) and wait_message.startswith("0)"):
             stage_value = "等待开票"
@@ -756,18 +875,14 @@ def buy_stream(config: BuyConfig):
                     errno, terminal_ret, terminal_rule = terminal_result
                     order_id = _extract_order_id(terminal_ret)
                     if terminal_rule.expose_payment_url and order_id is not None:
-                        payment_result = {
-                            "order_id": order_id,
-                            "order_detail_url": get_order_detail_url(order_id),
-                            "payment_code_url": None,
-                            "payment_qr_url": get_order_detail_url(order_id),
-                        }
-                        try:
-                            payment_result = build_payment_result(_request, order_id)
-                        except Exception as exc:
+                        payment_result, payment_error = (
+                            build_payment_result_with_fallback(_request, order_id)
+                        )
+                        if payment_error is not None:
                             yield emit(
                                 "status",
-                                f"获取支付二维码链接失败，将继续返回订单详情页: {exc}",
+                                "订单已创建，但未获取到支付二维码；该订单可能无需付款，"
+                                f"将继续返回订单详情页: {payment_error}",
                                 BuyStreamUpdate(
                                     order_id=payment_result["order_id"],
                                     order_detail_url=payment_result["order_detail_url"],
@@ -830,7 +945,21 @@ def buy_stream(config: BuyConfig):
                     ),
                 )
                 order_id = request_result["data"]["orderId"]  # type: ignore
-                payment_result = build_payment_result(_request, order_id)
+                payment_result, payment_error = build_payment_result_with_fallback(
+                    _request, order_id
+                )
+                if payment_error is not None:
+                    yield emit(
+                        "status",
+                        "订单已创建，但未获取到支付二维码；该订单可能无需付款，"
+                        f"将继续返回订单详情页: {payment_error}",
+                        BuyStreamUpdate(
+                            order_id=payment_result["order_id"],
+                            order_detail_url=payment_result["order_detail_url"],
+                            payment_qr_url=payment_result["payment_qr_url"],
+                            status="succeeded",
+                        ),
+                    )
                 for payment_event in emit_payment_details(
                     payment_result,
                     status="succeeded",
@@ -858,8 +987,22 @@ def buy_stream(config: BuyConfig):
                     qr_gen.make(fit=True)
                     qr_gen_image = qr_gen.make_image()
                     qr_gen_image.show()  # type: ignore
-                # 让 Server酱/Bark/PushPlus 等渠道的 HTTP 请求有时间发完，否则会被掐断。
+                # 让 Server酱/Bark/PushPlus 等渠道的 daemon 线程有时间持续重发。
                 notifierManager.join_all(timeout=15)
+                # 关键：退出前做一次同步阻塞发送（带 timeout+重试），确认送达再退出。
+                # 不依赖 daemon 线程——UI 模式 os._exit(0) 会硬杀 daemon 线程，导致丢失。
+                # 本调用发生在生成器 yield 完成、buy_cmd 退出（含 os._exit）之前。
+                notify_retries, notify_backoff = _resolve_notify_retry_params(
+                    config.notifier_config
+                )
+                results = notifierManager.send_all_sync(
+                    title="抢票成功",
+                    content=f"bilibili会员购，请尽快前往订单中心付款: {detail}",
+                    retries=notify_retries,
+                    backoff=notify_backoff,
+                )
+                if results and not any(results.values()):
+                    logger.error("所有通知渠道同步发送均失败，请检查推送配置或网络。")
                 break
         except (HTTPError, RequestException) as e:
             logger.exception(e)

@@ -27,6 +27,20 @@ UiCommand = Annotated[
 CliCommand = BuyCommand | UiCommand
 
 
+def _configure_console_encoding() -> None:
+    """Make Tyro's Unicode help text safe on legacy Windows consoles."""
+
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if not callable(reconfigure):
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="backslashreplace")
+        except (OSError, ValueError):
+            # Some embedded or redirected streams cannot be reconfigured.
+            pass
+
+
 def _normalize_argv(argv: list[str]) -> list[str]:
     normalized = [
         "--config-file" if arg in {"-cf", "--config-file"} else arg for arg in argv
@@ -43,9 +57,22 @@ def _normalize_argv(argv: list[str]) -> list[str]:
     return ["ui", *argv]
 
 
+def _explicit_cli_flags(argv: list[str]) -> set[str]:
+    """从命令行 argv 中提取用户显式传入的 flag 集合（形如 --interval / --xxx=y）。"""
+    flags: set[str] = set()
+    for arg in argv:
+        if arg.startswith("--"):
+            flags.add(arg.split("=", 1)[0])
+    return flags
+
+
 def main() -> None:
-    command = tyro.cli(CliCommand, args=_normalize_argv(sys.argv[1:]))  # type: ignore
+    _configure_console_encoding()
+    argv = _normalize_argv(sys.argv[1:])
+    command = tyro.cli(CliCommand, args=argv)  # type: ignore
     if isinstance(command, BuyCliArgs):
+        # buy(无头)命令下用环境变量回填未显式传入的字段：CLI > env(BTB_*) > 默认值
+        command = command.merge_env(_explicit_cli_flags(argv))
         buy_cmd(command)
         return
     ticker_cmd(command)
