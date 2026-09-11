@@ -62,6 +62,7 @@ from util.request.exceptions import BiliConnectionError, BiliRateLimitError
 
 
 LOCAL_FANOUT_PROXY_STRATEGY = "local_fanout"
+PREPARE_NOT_OPEN_BACKOFF_SECONDS = 0.5
 
 
 @dataclass(slots=True)
@@ -657,6 +658,21 @@ def buy_stream(config: BuyConfig):
             )
             order_token = _extract_prepare_token(request_result)
             if not order_token:
+                try:
+                    prepare_errno = int(
+                        request_result.get(
+                            "errno",
+                            request_result.get("code", -1),
+                        )
+                    )
+                except (AttributeError, TypeError, ValueError):
+                    prepare_errno = None
+                if prepare_errno == 100041:
+                    logger.info(
+                        "订单准备返回 100041 未到开票时间，等待 {:.1f}s 后重试",
+                        PREPARE_NOT_OPEN_BACKOFF_SECONDS,
+                    )
+                    time.sleep(PREPARE_NOT_OPEN_BACKOFF_SECONDS)
                 yield emit_reprepare("订单准备未返回有效 token")
                 continue
             # else:

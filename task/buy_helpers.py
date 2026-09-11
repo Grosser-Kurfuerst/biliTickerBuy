@@ -167,17 +167,14 @@ def wait_until_start(
             f"（时间源: {getattr(time_service, 'time_source', 'unknown')}）"
         )
     }
-    bili_check = time_service.compute_bili_time_check(attempts=2, timeout=1.5)
-    if bili_check is not None:
-        yield {
-            "message": (
-                "会员购Date校验: "
-                f"与当前时间源差异约{bili_check.offset_center - timeoffset:+.3f}秒，"
-                f"不确定度约±{bili_check.uncertainty_seconds:.3f}秒，"
-                f"RTT {bili_check.delay * 1000:.1f}ms"
-            )
-        }
-        yield {"message": "倒计时默认使用会员购 Date 时间源。"}
+    countdown_source = getattr(time_service, "time_source", "unknown")
+    logger.info(
+        "最终倒计时对时结果: source={}, "
+        "ntp_offset(local-reference)={:+.5f}s",
+        countdown_source,
+        timeoffset,
+    )
+
 
     for fmt in (
         "%Y-%m-%dT%H:%M:%S",
@@ -197,18 +194,8 @@ def wait_until_start(
 
     yield {"message": f"计划抢票开始时间: {target_time.strftime('%Y-%m-%d %H:%M:%S')}"}
 
-    if hasattr(time_service, "countdown_now"):
-        countdown_now = time_service.countdown_now
-    else:
-        countdown_now = time_service.now
-    if hasattr(time_service, "countdown_time_source"):
-        countdown_source = time_service.countdown_time_source
-    else:
-
-        def countdown_source():
-            return getattr(time_service, "time_source", "unknown")
-
-    yield {"message": f"倒计时时间源: {countdown_source()}"}
+    countdown_now = getattr(time_service, "now", time_service.countdown_now)
+    yield {"message": f"倒计时时间源: {countdown_source}"}
     time_difference = target_time.timestamp() - countdown_now()
     end_time = time.perf_counter() + time_difference
     next_report_at = float("inf")
